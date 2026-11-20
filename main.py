@@ -4,37 +4,77 @@
 Reads every *.in case in the input directory and writes one <id>.out per case, one row per
 trophy, five quantiles of that trophy's earn rate at the case's target.
 
-How the forecast is made:
+The model, and why it is this one
+---------------------------------
 
-  1. Series. For each trophy, the steps at which its earn rate actually changed -- one
-     point per Exophase refresh, not the run of identical reads that follows it. The last
-     step is dated by the case's last read, because the page is known to have held that
-     level until then. Each point carries its earn count (rate x players tracked / 100),
-     which is how precisely the rate is known: a rate printed from seven earners is far
-     noisier than one printed from seven hundred, and the weight of a point follows it.
+A trophy's rate is not a level that drifts: it is a ratio the page recomputes at every
+refresh,
 
-  2. Transform. y = logit(rate) against u = ln(hours since the game's opening). A curve
-     that climbs fast and then flattens is close to a straight line in that plane over a
-     few days, and its bend is the part that matters four days later, so each trophy gets
-     a quadratic in u -- weighted, robust (Huber), so one stale or re-based page cannot
-     drag it.
+    rate_i = 100 * E_i / N
 
-  3. Pooling. Slopes and curvatures are shared. The pooled values are precision-weighted
-     means over the trophies, and each trophy's own are shrunk toward them by how much its
-     data can support (empirical Bayes, with the between-trophy spread estimated from the
-     trophies themselves). A trophy with fewer than four steps takes the pooled line.
+with E_i the tracked players holding trophy i and N the players tracked. Exophase holds
+that page still for hours and then replaces it whole. So between refreshes nothing moves,
+and at a refresh the numerator and the denominator both jump -- the denominator much
+harder, because a refresh is when the profiles of players who have barely started get
+counted. That single fact decides the whole forecast: a rate falls when N outruns E_i, and
+the fall is proportional to how far N jumps.
 
-  4. Prediction. The line is anchored at the last observed level and read at the target's
-     log time. The drift is trimmed: a local log-log fit extrapolated four days out
-     overshoots a curve that has to flatten, so the forecast takes 85% of it, and never
-     more than two logits.
+    z_i = logit(rate_i) = logit(E_i / N)
+    dz_i = dlogit(E_i) - dlogit(N) = (eps_i - 1) * dlogN
 
-  5. Spread. The five quantiles are normal in logit space around that median. The spread
-     is the model's own uncertainty about the extrapolation (a fixed number of logits per
-     e-fold of time extrapolated, so it grows with the distance to the target), plus the
-     page's own refresh-to-refresh jitter, plus the rate's counting noise
-     (1/sqrt(earn count), which matters for a trophy a few dozen players have earned),
-     plus a floor for model miss.
+where eps_i = dlogit(E_i)/dlogN is the trophy's earners elasticity to the tracked count.
+The forecast is therefore the last observed level plus beta_i * dlogN, with beta_i =
+eps_i - 1 pooled across trophies and shrunk toward zero, and dlogN the tracked count's
+growth from the last read to the target. Nothing else is extrapolated: no quadratic, no
+growth that the data does not show.
+
+The published launch-night refresh fixes the scale of both numbers, and it is the only
+refresh the kit documents in full (638 tracked / 943 earned -> 3,868 tracked / 4,276
+earned; every rate but the one at 100% fell). Taking the 100% trophy as pinned -- it holds
+every tracked player -- the free earners go 305 -> 408, so
+
+    eps = ln(408/305) / ln(3868/638) = 0.1614,   beta = eps - 1 = -0.8386
+    beta * ln(3868/638) = -1.5112
+
+which is exactly the loss the kit publishes for the persistence baseline (1.51): a
+constant logit shift is scored at |shift| when the quantiles are equal. The identity is
+what says this decomposition is the right one and that the practice truth is a refresh,
+not a level.
+
+Two paths, because a case has either seen a refresh or it has not
+-----------------------------------------------------------------
+
+  * Two or more distinct page states. Every transition between them is one refresh, and
+    every trophy gives one observation of dz_i / dlogN. Those observations are pooled
+    (Huber-weighted, recency-weighted) into beta, and each trophy's own beta is shrunk
+    toward the pool by how many transitions it has. The tracked count's growth is a
+    power law in time since the opening, fitted on the page states and shrunk hard toward
+    no growth (few blocks say little about a week), then read at the target.
+
+  * One page state. The page has not refreshed since before the game opened: the history
+    is the flat launch night. No growth can be fitted from a flat line, so the forecast
+    takes the one jump the kit documents -- the first refresh of a launch -- at the scale
+    the published pair gives (N x 6.06, eps = 0.1614, applied once).
+
+The spread is measured, not assumed
+-----------------------------------
+
+The quantiles are the centre plus the 5th, 25th, 50th, 75th and 95th percentiles of the
+residual the same forecast made when it was asked the same question before:
+
+  * Two or more page states: for every refresh, the model is refitted on the page states
+    before it, asked for that refresh's rates, and its miss in logits is kept. Those misses
+    are the residual sample, rescaled to the target's dlogN. A trophy with at least
+    MIN_OWN_RESIDUALS misses of its own uses its own; the rest use the pool.
+  * One page state: there is no earlier refresh to be asked about, and every read in the
+    history is byte-identical, so a leave-the-last-read-out residual is exactly zero and
+    cannot calibrate anything. The spread then comes from what the published totals do not
+    settle -- how the 408 free earners are shared among the 54 trophies: proportional to
+    what they held, or equally. The logit gap between those two allocations is a real,
+    computable residual sample, and it is what the quantiles are set from.
+
+On top of either sample sits the one error no forecast can avoid: the page prints two
+decimals, so a rate is known to +-0.005 points, which in logits is 0.005 / (p(1-p)).
 
 Deterministic: no randomness, no clock, no network, standard library only.
 """
@@ -44,32 +84,45 @@ import math
 import os
 from datetime import datetime, timezone
 
+# The five levels the output contract names; the quantiles are set from the residual
+# distribution's own percentiles at these same levels.
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-# The standard normal's quantile at each level.
-Z = (-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722)
 
-RATE_FLOOR = 0.01           # the scorer clamps a rate here before its logit
+RATE_FLOOR = 0.01          # the scorer clamps a rate here before its logit
 RATE_CEIL = 99.99
-TIME_FLOOR_H = 1.0          # ln(hours since the opening) is undefined at the opening
-RECENCY_HALF_LIFE_H = 48.0  # a step two days old weighs half what the last one does
-COUNT_WEIGHT_CAP = 4000.0   # a very common trophy is not more precise than this
-SLOPE_MIN, SLOPE_MAX = -0.30, 2.50
-CURVE_MIN, CURVE_MAX = -0.80, 0.10
-PRIOR_SLOPE = 0.60          # logit per ln-hour, when no trophy has a slope of its own
-PRIOR_SLOPE_SD = 0.40       # between-trophy slope spread, before the trophies say otherwise
-PRIOR_CURVE = -0.20         # between-trophy curvature, before the trophies say otherwise
-PRIOR_CURVE_SD = 0.25
-TAU2_MIN, TAU2_MAX = 0.03, 0.50
-DRIFT_TRIM = 0.85           # a local log-log fit over-extrapolates a curve that must flatten
-MAX_DRIFT = 2.00            # logit: the most the trend may move a trophy's median
-TREND_PER_EFOLD = 0.28      # logit of uncertainty per unit of ln-time extrapolated
-STEP_JITTER_MAX = 0.25      # logit: a bigger refresh-to-refresh miss is model misfit
-STEP_JITTER_WEIGHT = 0.25   # how much of that jitter carries into the target's spread
-SIGMA_FLOOR = 0.15          # logit: model miss the spread above cannot see
-SIGMA_MIN, SIGMA_MAX = 0.10, 2.50
-MIN_QUAD_POINTS = 4         # steps needed before a trophy has a curvature of its own
-MIN_QUAD_SPAN = 0.45        # ln-hours its steps must span
-SE_TWO_POINTS = 0.70        # a two-step slope is worth little: shrink it hard
+TIME_FLOOR_H = 1.0         # ln(hours since the opening) is undefined at the opening
+RECENCY_HALF_LIFE_H = 24.0 # an older refresh says less about the next one
+MIN_TRANSITION_DLOGN = 0.02  # a refresh that moved the tracked count by less than 2%
+                             # says nothing about the elasticity: skip it
+MIN_RESIDUAL_DLOGN = 0.05    # same, for a residual that is about to be rescaled
+MAX_RESIDUAL_SCALE = 3.0     # never stretch an observed miss further than this
+CENSORED_RATE = 0.02         # at or below this the two-decimal print cannot show a move
+
+# --- the published launch-night refresh (RULES.txt "What is counted"; competition.yaml
+# "The practice"). The only refresh the kit documents in full, so the only one whose
+# elasticity can be known before the case is read.
+LAUNCH_N_BEFORE = 638.0
+LAUNCH_E_BEFORE = 943.0
+LAUNCH_N_AFTER = 3868.0
+LAUNCH_E_AFTER = 4276.0
+
+# beta = dlogit(rate)/dlogN implied by that pair, with the 100% trophy pinned to every
+# tracked player (see the module docstring for the arithmetic: 0.1614 - 1).
+PRIOR_BETA = -0.8385513639512452
+PRIOR_LOG_TRACKED_JUMP = 1.802154573228395   # ln(3868/638)
+
+BETA_MIN, BETA_MAX = -1.60, 0.40   # a rate cannot fall faster than 1/N without earners
+                                   # vanishing, and a dilution model has no reason to rise
+BETA_PRIOR_SD = 0.50               # logit per dlogN: the pool's prior, before the data
+BETA_OWN_PRIOR_SD = 0.30           # between-trophy spread around the pool
+TRACKED_EXPONENT_MAX = 2.50        # dlnN/dln t; launch growth is fast, not unbounded
+TRACKED_PRIOR_SD = 1.00            # dlnN/dln t before the states say otherwise
+MAX_TRACKED_JUMP = 1.60            # dlogN: the tracked count may at most x5 over a horizon
+MAX_DRIFT = 1.20                   # logit: the most the dilution may move a median
+MIN_OWN_RESIDUALS = 6              # a trophy's own spread needs this many misses
+RESIDUAL_SAMPLE_CAP = 400          # keep the residual sample cheap to sort
+SIGMA_FLOOR = 0.02                 # logit: below the two-decimal print, nothing is real
+
 
 
 def parse_time(text):
@@ -110,88 +163,17 @@ def median(values):
     return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
 
 
-def weighted_normal(xs, ys, ws, power):
-    """Weighted least squares for a polynomial of degree `power`.
-
-    Returns (coefficients, inverse of the normal matrix) or (None, None) if singular.
-    """
-    size = power + 1
-    ata = [[0.0] * size for _ in range(size)]
-    atb = [0.0] * size
-    for x, y, w in zip(xs, ys, ws):
-        xp = 1.0
-        row = []
-        for i in range(size):
-            row.append(xp)
-            xp *= x
-        for i in range(size):
-            atb[i] += w * row[i] * y
-            for j in range(size):
-                ata[i][j] += w * row[i] * row[j]
-    aug = [ata[i][:] + [atb[i]] for i in range(size)]
-    for col in range(size):
-        pivot = max(range(col, size), key=lambda r: abs(aug[r][col]))
-        if abs(aug[pivot][col]) < 1e-12:
-            return None, None
-        aug[col], aug[pivot] = aug[pivot], aug[col]
-        pv = aug[col][col]
-        aug[col] = [v / pv for v in aug[col]]
-        for r in range(size):
-            if r != col and aug[r][col] != 0.0:
-                f = aug[r][col]
-                aug[r] = [a - f * b for a, b in zip(aug[r], aug[col])]
-    coef = [aug[i][size] for i in range(size)]
-    # inverse of A^T A: Gauss-Jordan on the normal matrix
-    inv = [ata[i][:] + [1.0 if i == j else 0.0 for j in range(size)] for i in range(size)]
-    for col in range(size):
-        pivot = max(range(col, size), key=lambda r: abs(inv[r][col]))
-        if abs(inv[pivot][col]) < 1e-12:
-            return coef, None
-        inv[col], inv[pivot] = inv[pivot], inv[col]
-        pv = inv[col][col]
-        inv[col] = [v / pv for v in inv[col]]
-        for r in range(size):
-            if r != col and inv[r][col] != 0.0:
-                f = inv[r][col]
-                inv[r] = [a - f * b for a, b in zip(inv[r], inv[col])]
-    inv = [row[size:] for row in inv]
-    return coef, inv
-
-
-def robust_poly(xs, ys, ws, power):
-    """Huber-weighted polynomial. Returns (coefficients, covariance matrix or None).
-
-    A step whose level is off the rest -- launch night's stale page, a refresh that
-    re-based everything at once -- is down-weighted instead of dragging the fit.
-    """
-    w = list(ws)
-    coef, inv = weighted_normal(xs, ys, w, power)
-    if coef is None:
-        return None, None
-    n = len(xs)
-    for _ in range(16):
-        res = [y - sum(c * x ** i for i, c in enumerate(coef)) for x, y in zip(xs, ys)]
-        scale = 1.4826 * median([abs(r) for r in res])
-        if scale < 0.12:
-            scale = 0.12
-        c = 1.5 * scale
-        w = [(wi if abs(r) <= c else wi * c / abs(r)) for wi, r in zip(ws, res)]
-        coef2, inv2 = weighted_normal(xs, ys, w, power)
-        if coef2 is None:
-            break
-        done = max(abs(a - b) for a, b in zip(coef2, coef)) < 1e-10
-        coef, inv = coef2, inv2
-        if done:
-            break
-    sw = sum(w)
-    if inv is not None and sw > 0.0 and n > power + 1:
-        s2 = sum(wi * (y - sum(c * x ** i for i, c in enumerate(coef))) ** 2
-                 for wi, x, y in zip(w, xs, ys)) / sw
-        s2 = max(s2, 0.01)
-        inv = [[v * s2 for v in row] for row in inv]
-    else:
-        inv = None
-    return coef, inv
+def quantile(values, p):
+    """Linear-interpolated sample quantile; `values` need not be sorted."""
+    if not values:
+        return 0.0
+    v = sorted(values)
+    if len(v) == 1:
+        return v[0]
+    pos = p * (len(v) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(v) - 1)
+    return v[lo] + (pos - lo) * (v[hi] - v[lo])
 
 
 def opening_time(case):
@@ -208,8 +190,15 @@ def opening_time(case):
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-def build_series(case):
-    """Per trophy: the steps at which its rate changed, as [hours, rate, tracked]."""
+def page_states(case):
+    """The distinct pages the house saw, in order.
+
+    Exophase holds its page still between refreshes, so the run of identical reads that
+    follows a refresh is one page, not many observations. Each state is
+    {first_h, last_h, tracked, rates}: first_h when the page was first seen, last_h the
+    last read that still showed it. The last state's level is known to have held until the
+    case's last read, which is what dates the forecast.
+    """
     t0 = opening_time(case)
     reads = []
     for read in case.get("history") or []:
@@ -217,194 +206,463 @@ def build_series(case):
         if t is None:
             continue
         try:
-            tracked = float(read.get("players_tracked"))
+            tracked = float(read.get("players_tracked") or 0.0)
         except (TypeError, ValueError):
             tracked = 0.0
         reads.append(((t - t0).total_seconds() / 3600.0, tracked, read.get("rates") or []))
     reads.sort(key=lambda r: r[0])
 
-    per_trophy = []
-    for i in range(len(case.get("trophies") or [])):
-        steps = []
-        for hours, tracked, rates in reads:
-            rate = rates[i] if i < len(rates) else None
-            if rate is None:
-                continue
-            rate = float(rate)
-            if steps and steps[-1][1] == rate:
-                steps[-1][0] = hours        # the level held to this read
-            else:
-                steps.append([hours, rate, tracked])
-        if steps:
-            steps[-1][0] = reads[-1][0]
-        per_trophy.append(steps)
-    return per_trophy, reads
-
-
-def point_weight(hours, rate, tracked, last_hours):
-    """A step's weight: its earn count (Poisson precision in logit space), aged."""
-    count = rate * tracked / 100.0 if tracked > 0 else 1.0
-    count = clamp(count, 1.0, COUNT_WEIGHT_CAP)
-    return count * 0.5 ** (max(0.0, last_hours - hours) / RECENCY_HALF_LIFE_H)
-
-
-def fit_trophy(steps, last_hours):
-    """A trophy's own (slope, curvature, covariance), or None if it has too few steps.
-
-    Time is centred on the last step, so the slope is the rate's local slope at the last
-    read and the curvature its local bend -- the two numbers the extrapolation needs, and
-    the two that can sensibly be shared with other trophies.
-    """
-    if len(steps) < 2:
-        return None
-    u_last = math.log(max(steps[-1][0], TIME_FLOOR_H))
-    xs = [math.log(max(h, TIME_FLOOR_H)) - u_last for h, _, _ in steps]
-    ys = [logit(r) for _, r, _ in steps]
-    ws = [point_weight(h, r, n, last_hours) for h, r, n in steps]
-    span = max(xs) - min(xs)
-    if len(steps) >= MIN_QUAD_POINTS and span >= MIN_QUAD_SPAN:
-        coef, cov = robust_poly(xs, ys, ws, 2)
-        if coef is None:
-            return None
-        return {"b": coef[1], "c": coef[2], "cov": cov, "quad": True}
-    if span <= 1e-6:
-        return None
-    coef, cov = robust_poly(xs, ys, ws, 1)
-    if coef is None:
-        return None
-    return {"b": coef[1], "c": 0.0, "cov": cov, "quad": False}
-
-
-def pooled_params(fits):
-    """The shared slope and curvature, and how much trophies differ around them."""
-    lin = [(f["b"], f["cov"][1][1] if f["cov"] else SE_TWO_POINTS ** 2) for f in fits
-           if f is not None]
-    quad = [(f["c"], f["cov"][2][2] if f["cov"] else PRIOR_CURVE_SD ** 2) for f in fits
-            if f is not None and f["quad"]]
-
-    b_pool, tau2 = PRIOR_SLOPE, PRIOR_SLOPE_SD ** 2
-    if lin:
-        for _ in range(8):
-            ws = [1.0 / (se2 + tau2) for _, se2 in lin]
-            sw = sum(ws)
-            b_pool = clamp(sum(w * b for w, (b, _) in zip(ws, lin)) / sw, SLOPE_MIN, SLOPE_MAX)
-            var_obs = sum(w * (b - b_pool) ** 2 for w, (b, _) in zip(ws, lin)) / sw
-            mean_se2 = sum(se2 for _, se2 in lin) / len(lin)
-            tau2 = clamp(max(var_obs - mean_se2, TAU2_MIN), TAU2_MIN, TAU2_MAX)
-
-    c_pool, tau_c2 = PRIOR_CURVE, PRIOR_CURVE_SD ** 2
-    if len(quad) >= 5:
-        for _ in range(8):
-            ws = [1.0 / (se2 + tau_c2) for _, se2 in quad]
-            sw = sum(ws)
-            c_pool = clamp(sum(w * c for w, (c, _) in zip(ws, quad)) / sw, CURVE_MIN, CURVE_MAX)
-            var_obs = sum(w * (c - c_pool) ** 2 for w, (c, _) in zip(ws, quad)) / sw
-            mean_se2 = sum(se2 for _, se2 in quad) / len(quad)
-            tau_c2 = clamp(max(var_obs - mean_se2, 0.01), 0.01, 0.36)
-    return b_pool, tau2, c_pool, tau_c2
-
-
-def shrunk(fit, b_pool, tau2, c_pool, tau_c2):
-    """The trophy's own slope and curvature, pulled toward the pooled ones."""
-    if fit is None:
-        return b_pool, c_pool
-    cov = fit["cov"]
-    if cov is None:
-        return b_pool, c_pool
-    vb = max(cov[1][1], 1e-6)
-    b = (fit["b"] / vb + b_pool / tau2) / (1.0 / vb + 1.0 / tau2)
-    if fit["quad"] and cov[2][2] > 1e-9:
-        vc = cov[2][2]
-        c = (fit["c"] / vc + c_pool / tau_c2) / (1.0 / vc + 1.0 / tau_c2)
-    else:
-        c = 0.0
-    return clamp(b, SLOPE_MIN, SLOPE_MAX), clamp(c, CURVE_MIN, CURVE_MAX)
-
-
-def step_noise(series, params, reads, b_pool, tau2, c_pool, tau_c2):
-    """How far a refresh-to-refresh move lands from the fitted line, in logits.
-
-    Measured honestly: each trophy is refitted on every step but its last, and that line
-    is asked for the last step. This is the page's own jitter from refresh to refresh -- a
-    level error, not a drift error, so it is added to the spread as it stands rather than
-    grown with the horizon.
-    """
-    misses = []
-    for steps, (b, c) in zip(series, params):
-        if len(steps) < 2:
-            continue
-        (h_prev, r_prev, n_prev), (h_last, r_last, _) = steps[-2], steps[-1]
-        if n_prev <= 0 or r_prev * n_prev / 100.0 < 30.0:
-            continue
-        du = math.log(max(h_last, TIME_FLOOR_H)) - math.log(max(h_prev, TIME_FLOOR_H))
-        if du <= 1e-6:
-            continue
-        if len(steps) >= 3:
-            fit = fit_trophy(steps[:-1], h_prev)
-            b_use, c_use = shrunk(fit, b_pool, tau2, c_pool, tau_c2)
+    states = []
+    for hours, tracked, rates in reads:
+        key = (tracked, tuple(rates))
+        if states and states[-1]["key"] == key:
+            states[-1]["last_h"] = hours
         else:
-            b_use, c_use = b, c
-        predicted = logit(r_prev) + b_use * du + c_use * du * du
-        misses.append(abs(logit(r_last) - predicted))
-    if len(misses) < 5:
+            states.append({"key": key, "first_h": hours, "last_h": hours,
+                           "tracked": tracked, "rates": list(rates)})
+    return states
+
+
+def rate_at(state, index):
+    """A trophy's rate in one page state, or None if the page lacked it."""
+    rates = state["rates"]
+    if index >= len(rates):
+        return None
+    r = rates[index]
+    if r is None:
+        return None
+    try:
+        return float(r)
+    except (TypeError, ValueError):
+        return None
+
+
+def earners(rate, tracked):
+    """Earners behind a printed rate; 0 when the rate or the count is unusable."""
+    if rate is None or tracked <= 0:
         return 0.0
-    return clamp(math.sqrt(sum(m * m for m in misses) / len(misses)), 0.0, STEP_JITTER_MAX)
+    return rate * tracked / 100.0
 
 
-def forecast_trophy(steps, b, c, target_hours, step_jitter):
-    """One trophy's median logit at the target and the spread around it."""
-    if not steps:
-        return logit(1.0), 1.30
-    h_last, r_last, n_last = steps[-1]
-    y_last = logit(r_last)
-
-    if r_last <= 0.02:                      # nothing to extrapolate from
-        return y_last, 1.20
-
-    du = math.log(max(target_hours, TIME_FLOOR_H)) - math.log(max(h_last, TIME_FLOOR_H))
-    drift = DRIFT_TRIM * (b * du + c * du * du)
-    # A rate at the top of the page cannot go above 99.99, and its logit has no room to
-    # rise, so the median is held there while the spread still allows it to slip.
-    y_hat = min(logit(RATE_CEIL), y_last + clamp(drift, -MAX_DRIFT, MAX_DRIFT))
-
-    count = r_last * n_last / 100.0 if n_last > 0 else 1.0
-    sigma_count = min(1.20, 1.0 / math.sqrt(max(count, 1.0)))
-    # The extrapolation's own uncertainty, plus the page's refresh-to-refresh jitter.
-    sigma = math.sqrt((TREND_PER_EFOLD * du) ** 2 + (STEP_JITTER_WEIGHT * step_jitter) ** 2
-                      + sigma_count ** 2 + SIGMA_FLOOR ** 2)
-    return y_hat, clamp(sigma, SIGMA_MIN, SIGMA_MAX)
+def weighted_median(pairs):
+    """The value at which half the total weight sits (pairs of (value, weight))."""
+    if not pairs:
+        return 0.0
+    v = sorted(pairs, key=lambda p: p[0])
+    total = sum(w for _, w in v)
+    if total <= 0:
+        return median([x for x, _ in v])
+    acc = 0.0
+    for value, w in v:
+        acc += w
+        if acc >= 0.5 * total:
+            return value
+    return v[-1][0]
 
 
-def quantiles(y_hat, sigma):
-    out = []
-    for z in Z:
-        pct = 100.0 * inv_logit(y_hat + z * sigma)
-        out.append(round(clamp(pct, RATE_FLOOR, RATE_CEIL), 4))
-    for i in range(1, len(out)):
-        if out[i] < out[i - 1]:
-            out[i] = out[i - 1]
-    return out
+def transition_observations(states):
+    """One (dz/dlogN) observation per trophy per refresh, with its weight.
+
+    A refresh is one step between page states. dz is the trophy's logit move across it and
+    dlogN the tracked count's; their ratio is the trophy's elasticity minus one, which is
+    the number the forecast needs. The weight is the precision of that ratio: the counting
+    noise of the two earn counts (1/E in logit space) and the page's two-decimal print
+    (0.005 / (p(1-p))), summed, times a recency decay. A trophy printed at 0.01% moves by
+    less than the print can resolve and carries almost no weight, which is right.
+    """
+    obs = []
+    for b in range(1, len(states)):
+        prev, cur = states[b - 1], states[b]
+        if prev["tracked"] <= 0 or cur["tracked"] <= 0:
+            continue
+        dlog_n = math.log(cur["tracked"] / prev["tracked"])
+        if dlog_n < MIN_TRANSITION_DLOGN:
+            continue
+        age = max(0.0, states[-1]["last_h"] - cur["first_h"])
+        recency = 0.5 ** (age / RECENCY_HALF_LIFE_H)
+        for i in range(len(cur["rates"])):
+            r_prev = rate_at(prev, i)
+            r_cur = rate_at(cur, i)
+            if r_prev is None or r_cur is None or r_prev <= 0.0 or r_cur <= 0.0:
+                continue
+            if r_prev >= RATE_CEIL or r_cur >= RATE_CEIL:
+                continue                      # a 100% rate is pinned, not elastic
+            if r_prev <= CENSORED_RATE or r_cur <= CENSORED_RATE:
+                # at the print's floor the rate cannot show the move it made: censored
+                continue
+            e_prev = earners(r_prev, prev["tracked"])
+            e_cur = earners(r_cur, cur["tracked"])
+            var = (1.0 / max(e_prev, 1.0) + 1.0 / max(e_cur, 1.0)
+                   + rounding_sigma(r_prev) ** 2 + rounding_sigma(r_cur) ** 2)
+            obs.append({"trophy": i, "b": b, "dlog_n": dlog_n,
+                        "dz": logit(r_cur) - logit(r_prev),
+                        "weight": recency / var, "z_prev": logit(r_prev)})
+    return obs
+
+
+def robust_slope(rows):
+    """Weighted least squares through the origin of dz on dlogN, with a Huber reweight.
+
+    Returns (slope, variance of the slope). Fitting the slope directly, rather than
+    averaging the per-trophy ratios dz/dlogN, keeps a refresh that barely moved the tracked
+    count from producing a wild ratio: it contributes little to sum(w * dlogN^2) and so
+    little to the answer.
+    """
+    if not rows:
+        return 0.0, float("inf")
+    num = sum(r["weight"] * r["dlog_n"] * r["dz"] for r in rows)
+    den = sum(r["weight"] * r["dlog_n"] ** 2 for r in rows)
+    if den <= 1e-12:
+        return 0.0, float("inf")
+    beta = num / den
+    for _ in range(3):
+        resid = [(abs(r["dz"] - beta * r["dlog_n"]), r["weight"]) for r in rows]
+        scale = max(1.4826 * weighted_median(resid), 0.05)
+        cut = 1.5 * scale
+        num = 0.0
+        den = 0.0
+        for r in rows:
+            d = abs(r["dz"] - beta * r["dlog_n"])
+            w = r["weight"] if d <= cut else r["weight"] * cut / d
+            num += w * r["dlog_n"] * r["dz"]
+            den += w * r["dlog_n"] ** 2
+        if den <= 1e-12:
+            break
+        beta = num / den
+    if den <= 1e-12:
+        return beta, float("inf")
+    # The slope's variance from the scatter the fit actually leaves, not from the assumed
+    # counting noise: if the refresh steps follow beta tightly, the slope is known tightly,
+    # and if they scatter, it is not.
+    resid = [(abs(r["dz"] - beta * r["dlog_n"]), r["weight"]) for r in rows]
+    cut = 1.5 * max(1.4826 * weighted_median(resid), 0.05)
+    sw = 0.0
+    sr = 0.0
+    for r in rows:
+        d = abs(r["dz"] - beta * r["dlog_n"])
+        w = r["weight"] if d <= cut else r["weight"] * cut / d
+        sw += w
+        sr += w * d * d
+    s2 = sr / sw if sw > 0 else 0.0
+    return beta, s2 / den
+
+
+def fit_betas(observations, n_trophies, upto_state=None):
+    """The pooled beta and each trophy's own, shrunk toward it.
+
+    `upto_state` restricts the fit to transitions that ended before that page state, which
+    is how the model is refitted to forecast a refresh it has not seen.
+    """
+    rows = [o for o in observations if upto_state is None or o["b"] < upto_state]
+    beta_raw, beta_var = robust_slope(rows) if rows else (0.0, float("inf"))
+    # A weakly informative prior: without the data, a refresh's dilution is 0 +- 0.5 logits
+    # per unit of log tracked. Shrinking by the slope's own variance, not by a count, means
+    # a well-measured beta is left alone and a thin one is pulled hard to zero.
+    prior_var = BETA_PRIOR_SD ** 2
+    if beta_var < float("inf"):
+        pooled = beta_raw * prior_var / (beta_var + prior_var)
+    else:
+        pooled = 0.0
+    pooled = clamp(pooled, BETA_MIN, BETA_MAX)
+
+    by_trophy = {}
+    for o in rows:
+        by_trophy.setdefault(o["trophy"], []).append(o)
+
+    own = [pooled] * n_trophies
+    own_var = BETA_OWN_PRIOR_SD ** 2
+    for i, mine in by_trophy.items():
+        b_i, v_i = robust_slope(mine)
+        if v_i < float("inf"):
+            # a trophy's own beta is pulled toward the pool, with a prior as wide as
+            # trophies are known to differ from each other
+            own[i] = clamp(pooled + (b_i - pooled) * own_var / (v_i + own_var),
+                           BETA_MIN, BETA_MAX)
+    return pooled, own
+
+
+def tracked_growth(states, target_h):
+    """dlogN from the last read to the target, from the tracked count's own growth.
+
+    ln N against ln(hours since the opening): a power law, which is what a count that
+    explodes at launch and slows as the week goes on looks like over a few days. The
+    exponent is fitted on the page states, weighted toward the recent ones and shrunk
+    toward zero by how few states there are -- a couple of refreshes say little about the
+    next four days.
+    """
+    pts = [(math.log(max(s["first_h"], TIME_FLOOR_H)), math.log(s["tracked"]))
+           for s in states if s["tracked"] > 0 and s["first_h"] > 0]
+    if len(pts) < 3:
+        return 0.0
+    last_h = states[-1]["last_h"]
+    x0 = math.log(max(last_h, TIME_FLOOR_H))
+    y0 = math.log(max(states[-1]["tracked"], 1.0))
+    num = 0.0
+    den = 0.0
+    weights = []
+    for x, y in pts:
+        age = max(0.0, last_h - math.exp(x))
+        w = 0.5 ** (age / (2.0 * RECENCY_HALF_LIFE_H))
+        weights.append((w, x, y))
+        num += w * (x - x0) * (y - y0)
+        den += w * (x - x0) ** 2
+    if den <= 1e-12:
+        return 0.0
+    exponent = num / den
+    # its own standard error, from how well the power law fits the states it was fitted on
+    s2 = sum(w * (y - y0 - exponent * (x - x0)) ** 2 for w, x, y in weights)
+    sw = sum(w for w, _, _ in weights)
+    se2 = (s2 / sw) / den if sw > 0 else float("inf")
+    prior_var = TRACKED_PRIOR_SD ** 2
+    if se2 < float("inf"):
+        exponent *= prior_var / (se2 + prior_var)
+    else:
+        return 0.0
+    exponent = clamp(exponent, 0.0, TRACKED_EXPONENT_MAX)
+    if target_h <= last_h:
+        return 0.0
+    return clamp(exponent * math.log(max(target_h, TIME_FLOOR_H) / max(last_h, TIME_FLOOR_H)),
+                 0.0, MAX_TRACKED_JUMP)
+
+
+def refresh_residuals(states, observations, n_trophies, target_dlog_n):
+    """The model's own misses, measured on the refreshes it has already seen.
+
+    For every page state after the second, the betas are refitted on the states before it
+    and the model is asked for that state's rates; the miss, in logits, is kept and
+    rescaled to the target's dlogN. This is the leave-the-refresh-out residual the spread
+    is built from: a genuine out-of-sample error, per trophy, at the size the forecast
+    faces now.
+    """
+    per_trophy = [[] for _ in range(n_trophies)]
+    pooled = []
+    # From the third page state on: at the second there is no earlier refresh to fit on,
+    # so a miss there measures the absence of data, not the model's error.
+    for b in range(3, len(states)):
+        _, betas = fit_betas(observations, n_trophies, upto_state=b)
+        prev, cur = states[b - 1], states[b]
+        if prev["tracked"] <= 0 or cur["tracked"] <= 0:
+            continue
+        dlog_n = math.log(cur["tracked"] / prev["tracked"])
+        if dlog_n < MIN_RESIDUAL_DLOGN:
+            continue
+        scale = clamp(target_dlog_n / dlog_n, 0.0, MAX_RESIDUAL_SCALE)
+        for i in range(n_trophies):
+            r_prev = rate_at(prev, i)
+            r_cur = rate_at(cur, i)
+            if r_prev is None or r_cur is None or r_prev <= 0.0 or r_cur <= 0.0:
+                continue
+            if r_prev >= RATE_CEIL or r_cur >= RATE_CEIL:
+                continue
+            # the same step the forecast makes: multiplicative in the rate, not additive in
+            # the logit, so the residual measures the model that is actually shipped
+            predicted = logit(min(RATE_CEIL, r_prev * math.exp(betas[i] * dlog_n)))
+            e = (logit(r_cur) - predicted) * scale
+            per_trophy[i].append(e)
+            pooled.append(e)
+    return per_trophy, pooled
+
+
+def allocation_residuals(states, n_trophies):
+    """The spread a single flat page leaves open, from the published totals alone.
+
+    The history has not refreshed, so no miss can be measured. What the published pair does
+    not settle is how the free earners -- 4,276 - 3,868 = 408 of them -- are shared among
+    the trophies that are not at 100%: in proportion to the earners they already had, or
+    equally. Both allocations reproduce the published totals and both reproduce the
+    published persistence loss; the logit distance between them is therefore the honest
+    size of what is unknown, and it is computed here per trophy rather than assumed.
+    """
+    last = states[-1]
+    n_after = LAUNCH_N_AFTER
+    n_before = last["tracked"] if last["tracked"] > 0 else LAUNCH_N_BEFORE
+    free_after = LAUNCH_E_AFTER - LAUNCH_N_AFTER          # 408
+    free_before = LAUNCH_E_BEFORE - LAUNCH_N_BEFORE       # 305
+    if free_after <= 0 or free_before <= 0:
+        return [[] for _ in range(n_trophies)], []
+    k = free_after / free_before                          # 1.3377
+    free_count = 0
+    for i in range(n_trophies):
+        r = rate_at(last, i)
+        if r is not None and 0.0 < r < RATE_CEIL:
+            free_count += 1
+    per_trophy = [[] for _ in range(n_trophies)]
+    pooled = []
+    if free_count == 0:
+        return per_trophy, pooled
+    equal_share = free_after / free_count
+    for i in range(n_trophies):
+        r = rate_at(last, i)
+        if r is None or r <= 0.0 or r >= RATE_CEIL:
+            continue
+        e_before = earners(r, n_before)
+        if e_before <= 0.0:
+            continue
+        z_prop = logit(min(RATE_CEIL, 100.0 * (e_before * k) / n_after))
+        z_equal = logit(min(RATE_CEIL, 100.0 * equal_share / n_after))
+        per_trophy[i].append(z_prop - z_equal)
+        pooled.append(z_prop - z_equal)
+    return per_trophy, pooled
+
+
+def rounding_sigma(rate_pct):
+    """The logit width the page's two decimals cannot resolve."""
+    p = clamp(rate_pct, RATE_FLOOR, RATE_CEIL) / 100.0
+    return 0.005 / 100.0 / max(p * (1.0 - p), 1e-9)
+
+
+def quantiles(z_centre, residuals, rate_last, rate_target):
+    """Five quantiles: the centre plus the residual distribution's own percentiles.
+
+    The residuals are centred on their median, so the 50% quantile is the centre -- the
+    last observed level plus the dilution the data supports -- and nothing else moves it.
+    They are then widened for the one error the residuals cannot carry: the page prints two
+    decimals, and at the target the rate is smaller than at the anchor, so a printed point
+    resolves less. The two tails are floored the same way, so a tight sample gives tight
+    quantiles but never a degenerate row.
+    """
+    if residuals:
+        m = median(residuals)
+        sample = [r - m for r in residuals]
+        if len(sample) > RESIDUAL_SAMPLE_CAP:
+            step = len(sample) / float(RESIDUAL_SAMPLE_CAP)
+            sample = [sample[int(i * step)] for i in range(RESIDUAL_SAMPLE_CAP)]
+    else:
+        sample = []
+    floor_anchor = max(SIGMA_FLOOR, rounding_sigma(rate_last))
+    floor_target = max(SIGMA_FLOOR, rounding_sigma(rate_target))
+    extra2 = max(0.0, floor_target ** 2 - floor_anchor ** 2)
+    if sample and extra2 > 0.0:
+        sd = math.sqrt(sum(v * v for v in sample) / len(sample))
+        if sd > 1e-9:
+            factor = math.sqrt(1.0 + extra2 / (sd * sd))
+            sample = [v * factor for v in sample]
+    if sample:
+        out = [quantile(sample, level) for level in LEVELS]
+    else:
+        out = [-floor_target, -floor_target, 0.0, floor_target, floor_target]
+    # the centre is the forecast: hold the median there, and let a lopsided sample shape
+    # only the side it leans to
+    out[2] = 0.0
+    out[1] = min(out[1], 0.0)
+    out[3] = max(out[3], 0.0)
+    out[0] = min(out[0], out[1], -floor_target)
+    out[4] = max(out[4], out[3], floor_target)
+    pcts = []
+    for q in out:
+        pct = 100.0 * inv_logit(z_centre + q)
+        pcts.append(round(clamp(pct, RATE_FLOOR, RATE_CEIL), 4))
+    for i in range(1, len(pcts)):
+        if pcts[i] < pcts[i - 1]:
+            pcts[i] = pcts[i - 1]
+    return pcts
+
+
+def tracked_residuals(states):
+    """One-step-ahead misses of the tracked count's own growth law.
+
+    The refresh residuals measure how well beta predicts a step's size *given* the step;
+    they say nothing about the tracked count's own extrapolation, which over four days is
+    the largest thing the forecast can get wrong. Each page state from the third on is
+    predicted from the states before it, and the miss in dlogN is kept.
+    """
+    errs = []
+    for b in range(3, len(states)):
+        prev, cur = states[b - 1], states[b]
+        if prev["tracked"] <= 0 or cur["tracked"] <= 0:
+            continue
+        actual = math.log(cur["tracked"] / prev["tracked"])
+        if actual <= MIN_RESIDUAL_DLOGN:
+            continue
+        predicted = tracked_growth(states[:b], cur["first_h"])
+        errs.append(actual - predicted)
+    return errs
 
 
 def forecast_case(case):
-    series, reads = build_series(case)
+    trophies = case.get("trophies") or []
+    n = len(trophies)
+    states = page_states(case)
+    if not states:
+        return [{"id": t.get("id"), "q": [1.0, 1.0, 1.0, 1.0, 1.0]} for t in trophies]
+
     t0 = opening_time(case)
     target = parse_time(case.get("target"))
     if target is not None:
-        target_hours = (target - t0).total_seconds() / 3600.0
+        target_h = (target - t0).total_seconds() / 3600.0
     else:
-        target_hours = reads[-1][0] if reads else 1.0
+        target_h = states[-1]["last_h"]
+    last = states[-1]
 
-    last_hours = reads[-1][0] if reads else 0.0
-    fits = [fit_trophy(steps, last_hours) for steps in series]
-    b_pool, tau2, c_pool, tau_c2 = pooled_params(fits)
-    params = [shrunk(f, b_pool, tau2, c_pool, tau_c2) for f in fits]
-    step_jitter = step_noise(series, params, reads, b_pool, tau2, c_pool, tau_c2)
+    observations = transition_observations(states)
+    if len(states) >= 2:
+        pooled_beta, betas = fit_betas(observations, n)
+        dlog_n = tracked_growth(states, target_h)
+    else:
+        # One page state: nothing has refreshed, so the first refresh of a launch is the
+        # only jump there is to forecast, at the scale the published pair fixes.
+        pooled_beta = PRIOR_BETA
+        betas = [PRIOR_BETA] * n
+        dlog_n = PRIOR_LOG_TRACKED_JUMP
+
+    # How far the tracked count's own extrapolation may be off, in the same units as the
+    # residual sample: the one-step misses, grown by how far beyond the history the target
+    # sits. It enters the spread through beta, because that is how it reaches a rate.
+    spread_from_tracked = 0.0
+    if len(states) >= 4:
+        errs = tracked_residuals(states)
+        if len(errs) >= 2:
+            rms = math.sqrt(sum(e * e for e in errs) / len(errs))
+            span = max(states[-1]["last_h"] - states[0]["first_h"], 1.0)
+            ahead = max(0.0, target_h - states[-1]["last_h"])
+            spread_from_tracked = abs(pooled_beta) * rms * math.sqrt(1.0 + ahead / span)
+
+    per_trophy_res, pooled_res = ([[] for _ in range(n)], [])
+    if len(states) >= 2:
+        per_trophy_res, pooled_res = refresh_residuals(states, observations, n, dlog_n)
+    if not pooled_res:
+        per_trophy_res, pooled_res = allocation_residuals(states, n)
+    if pooled_res and spread_from_tracked > 0.0:
+        sd = math.sqrt(sum(v * v for v in pooled_res) / len(pooled_res))
+        factor = math.sqrt(1.0 + (spread_from_tracked / sd) ** 2) if sd > 1e-9 else 1.0
+        if factor > 1.0:
+            pooled_res = [v * factor for v in pooled_res]
+            per_trophy_res = [[v * factor for v in row] for row in per_trophy_res]
 
     rows = []
-    for trophy, steps, (b, c) in zip(case.get("trophies") or [], series, params):
-        y_hat, sigma = forecast_trophy(steps, b, c, target_hours, step_jitter)
-        rows.append({"id": trophy.get("id"), "q": quantiles(y_hat, sigma)})
+    for i, trophy in enumerate(trophies):
+        rate_last = rate_at(last, i)
+        if rate_last is None:
+            # the last page did not list it: carry the last rate that was listed
+            for state in reversed(states):
+                rate_last = rate_at(state, i)
+                if rate_last is not None:
+                    break
+        if rate_last is None or rate_last <= 0.0:
+            rows.append({"id": trophy.get("id"), "q": [RATE_FLOOR, RATE_FLOOR,
+                                                        RATE_FLOOR, RATE_FLOOR, RATE_FLOOR]})
+            continue
+
+        if rate_last >= RATE_CEIL:
+            # every tracked player holds it, and a refresh adds players who hold it too
+            z_centre = logit(RATE_CEIL)
+            residual_sample = [0.0]
+        else:
+            drift = betas[i] * dlog_n
+            if len(states) >= 2:
+                # MAX_DRIFT guards a power law read four days out; the published launch
+                # jump is a measured step, not an extrapolation, so it is not trimmed.
+                drift = clamp(drift, -MAX_DRIFT, MAX_DRIFT)
+            # The step belongs in rate space, where the model lives: rate = E / N and both
+            # are counts. Adding it in logits would overshoot the bigger rates, because
+            # logit is not linear in the rate.
+            rate_centre = min(RATE_CEIL, rate_last * math.exp(drift))
+            z_centre = logit(rate_centre)
+            residual_sample = per_trophy_res[i] if len(per_trophy_res[i]) >= MIN_OWN_RESIDUALS \
+                else pooled_res
+        rows.append({"id": trophy.get("id"),
+                     "q": quantiles(z_centre, residual_sample, rate_last,
+                                    100.0 * inv_logit(z_centre))})
     return rows
 
 
